@@ -9,16 +9,30 @@ and timm DA(https://github.com/rwightman/pytorch-image-models)
 import torch
 from torchvision import transforms
 
-from timm.data.transforms import RandomResizedCropAndInterpolation
+try:
+    from timm.data.transforms import RandomResizedCropAndInterpolation
+except ImportError:
+    # timm internals changed across releases; keep 3Augment usable on newer stacks.
+    from torchvision.transforms import InterpolationMode
 
-import numpy as np
-from torchvision import datasets, transforms
+    class RandomResizedCropAndInterpolation(transforms.RandomResizedCrop):
+        def __init__(self, size, scale=(0.08, 1.0), interpolation='bicubic'):
+            interpolation_map = {
+                'nearest': InterpolationMode.NEAREST,
+                'bilinear': InterpolationMode.BILINEAR,
+                'bicubic': InterpolationMode.BICUBIC,
+            }
+            super().__init__(
+                size=size,
+                scale=scale,
+                interpolation=interpolation_map.get(interpolation, InterpolationMode.BICUBIC),
+            )
+
 import random
 
 
 
 from PIL import ImageFilter, ImageOps
-import torchvision.transforms.functional as TF
 
 
 class GaussianBlur(object):
