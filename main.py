@@ -2,6 +2,7 @@
 # All rights reserved.
 import argparse
 import datetime
+import os
 import numpy as np
 import time
 import torch
@@ -28,12 +29,35 @@ import models
 import utils
 
 
+def enable_gradient_checkpointing(model: torch.nn.Module) -> bool:
+    """Best-effort switch for models exposing different checkpointing APIs."""
+    if hasattr(model, 'set_grad_checkpointing'):
+        model.set_grad_checkpointing(enable=True)
+        return True
+    if hasattr(model, 'set_gradient_checkpointing'):
+        model.set_gradient_checkpointing(enable=True)
+        return True
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        return True
+
+    enabled = False
+    for module in model.modules():
+        if hasattr(module, 'grad_checkpointing'):
+            module.grad_checkpointing = True
+            enabled = True
+        elif hasattr(module, 'use_checkpoint'):
+            module.use_checkpoint = True
+            enabled = True
+    return enabled
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=64, type=int)
-    parser.add_argument('--accum-iter', default=1, type=int,
-                        help='Accumulate gradients for this many iterations before optimizer.step()')
     parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--accumulation-steps', default=1, type=int,
+                        help='Number of gradient accumulation micro-steps before each optimizer step.')
     parser.add_argument('--bce-loss', action='store_true')
     parser.add_argument('--unscale-lr', action='store_true')
 
@@ -60,7 +84,7 @@ def get_args_parser():
                         help='Optimizer Epsilon (default: 1e-8)')
     parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
                         help='Optimizer Betas (default: None, use opt default)')
-    parser.add_argument('--clip-grad', type=float, default=5.0, metavar='NORM',
+    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
@@ -69,7 +93,7 @@ def get_args_parser():
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
-    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR', # 5e-4
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
@@ -84,7 +108,7 @@ def get_args_parser():
 
     parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
                         help='epoch interval to decay LR')
-    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N', #5
+    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
                         help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
@@ -153,6 +177,8 @@ def get_args_parser():
     # * Finetuning params
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
     parser.add_argument('--attn-only', action='store_true') 
+    parser.add_argument('--use-checkpoint', action='store_true',
+                        help='Enable gradient checkpointing to reduce memory usage (if supported by model).')
     
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
@@ -180,12 +206,52 @@ def get_args_parser():
     parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
                         help='')
     parser.set_defaults(pin_mem=True)
+    parser.add_argument('--persistent-workers', action='store_true',
+                        help='Keep DataLoader workers alive between epochs to avoid worker respawn overhead.')
+    parser.add_argument('--no-persistent-workers', action='store_false', dest='persistent_workers', help='')
+    parser.set_defaults(persistent_workers=True)
+    parser.add_argument('--prefetch-factor', default=4, type=int,
+                        help='Number of batches preloaded by each worker.')
+
+    parser.add_argument('--amp', action='store_true', help='Enable mixed precision for CUDA training.')
+    parser.add_argument('--no-amp', action='store_false', dest='amp', help='')
+    parser.set_defaults(amp=True)
+    parser.add_argument('--amp-dtype', default='float16', choices=['float16', 'bfloat16'],
+                        help='Autocast dtype used when AMP is enabled.')
+    parser.add_argument('--grad-set-to-none', action='store_true',
+                        help='Use optimizer.zero_grad(set_to_none=True).')
+    parser.add_argument('--no-grad-set-to-none', action='store_false', dest='grad_set_to_none', help='')
+    parser.set_defaults(grad_set_to_none=True)
+    parser.add_argument('--sync-step', action='store_true',
+                        help='Force CUDA synchronize at each step (debug/profiling only).')
+
+    parser.add_argument('--channels-last', action='store_true',
+                        help='Use channels_last memory format for model and input batches.')
+    parser.add_argument('--no-channels-last', action='store_false', dest='channels_last', help='')
+    parser.set_defaults(channels_last=True)
+
+    parser.add_argument('--tf32', action='store_true', help='Allow TF32 on Ampere+ GPUs.')
+    parser.add_argument('--no-tf32', action='store_false', dest='tf32', help='')
+    parser.set_defaults(tf32=True)
+    parser.add_argument('--matmul-precision', default='high', choices=['highest', 'high', 'medium'],
+                        help='Torch matmul precision policy for float32 GEMMs.')
+
+    parser.add_argument('--compile', action='store_true', dest='use_compile',
+                        help='Enable torch.compile for the training model.')
+    parser.add_argument('--compile-backend', default='inductor', type=str,
+                        help='torch.compile backend.')
+    parser.add_argument('--compile-mode', default='default', choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode.')
 
     # distributed training parameters
     parser.add_argument('--distributed', action='store_true', default=False, help='Enabling distributed training')
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--ddp-broadcast-buffers', action='store_true', default=False,
+                        help='Enable DDP buffer broadcasts.')
+    parser.add_argument('--ddp-static-graph', action='store_true', default=False,
+                        help='Enable static graph optimization for DDP.')
     return parser
 
 
@@ -196,6 +262,8 @@ def main(args):
 
     if args.distillation_type != 'none' and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
+    if args.accumulation_steps < 1:
+        raise ValueError(f"--accumulation-steps must be >= 1, got {args.accumulation_steps}")
 
     device = torch.device(args.device)
 
@@ -205,6 +273,14 @@ def main(args):
     np.random.seed(seed)
     # random.seed(seed)
 
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision(args.matmul_precision)
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
+        if args.amp and args.amp_dtype == 'bfloat16' and not torch.cuda.is_bf16_supported():
+            print('CUDA bf16 is not supported on this GPU. Falling back to float16 AMP.')
+            args.amp_dtype = 'float16'
     cudnn.benchmark = True
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
@@ -234,23 +310,37 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
+    train_loader_kwargs = dict(
+        dataset=dataset_train,
+        sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    if args.ThreeAugment:
-        data_loader_train.dataset.transform = new_data_aug_generator(args)
-
-    data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, sampler=sampler_val,
+    val_loader_kwargs = dict(
+        dataset=dataset_val,
+        sampler=sampler_val,
         batch_size=int(1.5 * args.batch_size),
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=False
+        drop_last=False,
     )
+    if args.pin_mem and device.type == 'cuda':
+        train_loader_kwargs['pin_memory_device'] = 'cuda'
+        val_loader_kwargs['pin_memory_device'] = 'cuda'
+    if args.num_workers > 0:
+        train_loader_kwargs['persistent_workers'] = args.persistent_workers
+        val_loader_kwargs['persistent_workers'] = args.persistent_workers
+        if args.prefetch_factor > 0:
+            train_loader_kwargs['prefetch_factor'] = args.prefetch_factor
+            val_loader_kwargs['prefetch_factor'] = args.prefetch_factor
+
+    data_loader_train = torch.utils.data.DataLoader(**train_loader_kwargs)
+    if args.ThreeAugment:
+        data_loader_train.dataset.transform = new_data_aug_generator(args)
+
+    data_loader_val = torch.utils.data.DataLoader(**val_loader_kwargs)
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -270,6 +360,11 @@ def main(args):
         drop_block_rate=None,
         img_size=args.input_size
     )
+    if args.use_checkpoint:
+        if enable_gradient_checkpointing(model):
+            print('Enabled gradient checkpointing.')
+        else:
+            print('Requested --use-checkpoint, but model does not expose a supported checkpointing API.')
 
                     
     if args.finetune:
@@ -331,6 +426,15 @@ def main(args):
             print('no patch embed')
             
     model.to(device)
+    if args.channels_last and device.type == 'cuda':
+        model = model.to(memory_format=torch.channels_last)
+    if args.use_compile:
+        print(f"Compiling model with torch.compile (backend={args.compile_backend}, mode={args.compile_mode})")
+        try:
+            model = torch.compile(model, backend=args.compile_backend, mode=args.compile_mode)
+        except Exception as exc:
+            print(f"torch.compile failed ({exc}). Continuing without compilation.")
+            args.use_compile = False
 
     model_ema = None
     if args.model_ema:
@@ -343,27 +447,20 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            broadcast_buffers=args.ddp_broadcast_buffers,
+            gradient_as_bucket_view=True,
+            static_graph=args.ddp_static_graph,
+        )
         model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_parameters = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
-
-    effective_batch_size = args.batch_size * args.accum_iter * utils.get_world_size()
-    print(f"Effective batch size: {effective_batch_size}")
-
     if not args.unscale_lr:
-        # Effective batch = batch_size * accum_iter * world_size
-        linear_scaled_lr = args.lr * effective_batch_size / 512.0
+        linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() * args.accumulation_steps / 512.0
         args.lr = linear_scaled_lr
-    print(f"Learning rate after scaling: {args.lr}")
-
-    # DeiT-Base is much more sensitive to optimizer spikes than tiny/small.
-    # Keep a safe default if user did not request a specific clipping threshold.
-    if args.clip_grad is None and args.model.startswith('deit_base'):
-        args.clip_grad = 1.0
-        print("Auto-setting clip_grad=1.0 for DeiT-Base stability. "
-              "Override with --clip-grad if you need a different value.")
-
+    print(f"Effective global batch size: {args.batch_size * utils.get_world_size() * args.accumulation_steps}")
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
@@ -425,7 +522,14 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
         lr_scheduler.step(args.start_epoch)
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(
+            data_loader_val,
+            model,
+            device,
+            amp=args.amp,
+            amp_dtype=args.amp_dtype,
+            channels_last=args.channels_last,
+        )
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
@@ -442,6 +546,12 @@ def main(args):
             args.clip_grad, model_ema, mixup_fn,
             set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
             args = args,
+            amp=args.amp,
+            amp_dtype=args.amp_dtype,
+            channels_last=args.channels_last,
+            grad_set_to_none=args.grad_set_to_none,
+            sync_step=args.sync_step,
+            accumulation_steps=args.accumulation_steps,
         )
 
         lr_scheduler.step(epoch)
@@ -459,7 +569,14 @@ def main(args):
                 }, checkpoint_path)
              
 
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(
+            data_loader_val,
+            model,
+            device,
+            amp=args.amp,
+            amp_dtype=args.amp_dtype,
+            channels_last=args.channels_last,
+        )
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
         if max_accuracy < test_stats["acc1"]:
