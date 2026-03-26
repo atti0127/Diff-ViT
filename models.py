@@ -2,320 +2,345 @@
 # All rights reserved.
 import torch
 import torch.nn as nn
-from functools import partial
-import math
 import torch.nn.functional as F
+import math
+import numbers
+from functools import partial
 
-from timm.models.vision_transformer import _cfg, init_weights_vit_timm, get_init_weights_vit
+from timm.models.vision_transformer import _cfg, LayerScale
+from timm.models.vision_transformer import (
+    _load_weights,
+    checkpoint_seq,
+    named_apply,
+    get_init_weights_vit,
+    init_weights_vit_timm,
+)
 from timm.models.registry import register_model
-from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_
-from timm.models.helpers import named_apply, checkpoint_seq
+from timm.models.layers import trunc_normal_
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple, Type, Union, List, Literal
+
+from torch.jit import Final
+
+from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, \
+    trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
+    get_act_layer, get_norm_layer, LayerType
 
 __all__ = [
-    'deit_tiny_patch16_224', 'deit_small_patch16_224', 'deit_base_patch16_224',
-    'deit_tiny_distilled_patch16_224', 'deit_small_distilled_patch16_224',
-    'deit_base_distilled_patch16_224', 'deit_base_patch16_384',
-    'deit_base_distilled_patch16_384',
+    'diff_deit_tiny_patch16_224'
 ]
 
-def _sanitize_model_kwargs(kwargs):
-    # timm>=0.6 passes these to model entrypoints; local ViT constructors don't accept them.
-    kwargs.pop('pretrained_cfg', None)
-    kwargs.pop('pretrained_cfg_overlay', None)
+
+def _cleanup_timm_factory_kwargs(kwargs):
+    # timm.create_model forwards internal factory args that older local model defs don't accept.
+    for key in ('pretrained_cfg', 'pretrained_cfg_overlay', 'scriptable', 'exportable', 'no_jit'):
+        kwargs.pop(key, None)
     return kwargs
 
 '''
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    fused_attn: Final[bool]
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: nn.Module = nn.LayerNorm,
+    ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = use_fused_attn()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-'''     
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5, elementwise_affine=True):
-        super().__init__()
-        self.eps = eps
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter("weight", None)
-
-    def forward(self, x):
-        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        if self.weight is not None:
-            x = x * self.weight
-        return x
-
-
+'''
+        
 class Attention(nn.Module):
-    """
-    DiffAttention2 with a global smooth bound on cosine logit scale.
-
-    Instead of a hard clamp like:
-        cos_scale = self.cos_logit_scale_log.clamp(max=log(max_scale)).exp()
-
-    this class uses:
-        cos_scale = cos_scale_min + (cos_scale_max - cos_scale_min) * sigmoid(raw)
-
-    Benefits:
-      - keeps cos_scale finite
-      - preserves gradients near the upper bound
-      - avoids the zero-gradient region introduced by hard clamping
-    """
-    def __init__(
-        self,
-        dim,
-        num_heads=8,
-        qkv_bias=False,
-        attn_drop=0.,
-            proj_drop=0.,
-            cos_scale_init=1.0,
-            cos_scale_min=0.0,
-            cos_scale_max=15.0,
-            cos_head_residual_alpha=0.5,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.embed_dim = dim
-
-        assert dim % (2 * num_heads) == 0, "embed_dim must be divisible by 2 * num_heads"
-        self.head_dim = dim // num_heads // 2
-
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.out_proj = nn.Linear(dim, dim)
-
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        self.lambda_init = 0.5
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
-
-        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
-        self.cos_eps = 1e-6
-        self.delta_gain = nn.Parameter(torch.zeros(num_heads))
-        self.cos_head_delta = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
-
-        cos_scale_init = float(cos_scale_init)
-        cos_scale_min = float(cos_scale_min)
-        cos_scale_max = float(cos_scale_max)
-        assert cos_scale_min < cos_scale_max, "cos_scale_min must be smaller than cos_scale_max"
-        assert cos_scale_min < cos_scale_init < cos_scale_max, \
-            "cos_scale_init should lie inside [cos_scale_min, cos_scale_max]"
-
-        init_ratio = (cos_scale_init - cos_scale_min) / (cos_scale_max - cos_scale_min)
-        init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
-        raw_init = math.log(init_ratio / (1.0 - init_ratio))
-
-        self.cos_logit_scale_raw = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
-        self.register_buffer("cos_scale_min", torch.tensor(cos_scale_min, dtype=torch.float32))
-        self.register_buffer("cos_scale_max", torch.tensor(cos_scale_max, dtype=torch.float32))
-        self.register_buffer("cos_head_residual_alpha", torch.tensor(float(cos_head_residual_alpha), dtype=torch.float32))
-
-    def _compute_cos_scale(self, dtype):
-        global_scale = self.cos_scale_min + (self.cos_scale_max - self.cos_scale_min) * torch.sigmoid(self.cos_logit_scale_raw)
-        head_delta = self.cos_head_delta - self.cos_head_delta.mean()
-        head_residual = 1.0 + self.cos_head_residual_alpha * torch.tanh(head_delta)
-        cos_scale = global_scale * head_residual
-        return cos_scale.to(dtype=dtype).view(1, self.num_heads, 1, 1)
-
-    def forward(self, x):
-        B, N, C = x.shape
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # q,k: [B, H, 2, N, d], v: [B, H, N, 2d]
-        q = q.view(B, N, self.num_heads, 2, self.head_dim).permute(0, 2, 3, 1, 4)
-        k = k.view(B, N, self.num_heads, 2, self.head_dim).permute(0, 2, 3, 1, 4)
-        v = v.view(B, N, self.num_heads, 2 * self.head_dim).transpose(1, 2)
-
-        q1, q2 = q[:, :, 0], q[:, :, 1]
-        k1, k2 = k[:, :, 0], k[:, :, 1]
-
-        cos_scale = self._compute_cos_scale(dtype=q.dtype)
-
-        q1n = F.normalize(q1, p=2, dim=-1, eps=self.cos_eps)
-        k1n = F.normalize(k1, p=2, dim=-1, eps=self.cos_eps)
-        L1 = (q1n @ k1n.transpose(-2, -1)) * cos_scale
-
-        q2n = F.normalize(q2, p=2, dim=-1, eps=self.cos_eps)
-        k2n = F.normalize(k2, p=2, dim=-1, eps=self.cos_eps)
-        L2 = (q2n @ k2n.transpose(-2, -1)) * cos_scale
-
-        L1 = torch.nan_to_num(L1)
-        L2 = torch.nan_to_num(L2)
-
-        delta = L1 - L2
-        gain = self.delta_gain.view(1, self.num_heads, 1, 1).to(dtype=delta.dtype)
-        G = torch.tanh(gain * delta)
-
-        L1 = L1 + G
-        L2 = L2 - G
-
-        A1 = L1.softmax(dim=-1, dtype=torch.float32).to(dtype=x.dtype)
-        A2 = L2.softmax(dim=-1, dtype=torch.float32).to(dtype=x.dtype)
-
-        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum().float()).to(x.dtype)
-        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum().float()).to(x.dtype)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-
-        attn = A1 - lambda_full * A2
-        attn = self.attn_drop(attn)
-
-        y = attn @ v
-        y = self.subln(y)
-        y = y * (1.0 - self.lambda_init)
-
-        y = y.transpose(1, 2).reshape(B, N, C)
-        y = self.out_proj(y)
-        y = self.proj_drop(y)
-        return y
-
-
-class Block(nn.Module):
+    fused_attn: torch.jit.Final[bool]
 
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            drop=0.,
-            attn_drop=0.,
-            init_values=None,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm
-    ):
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_bias: bool = True,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            device=None,
+            dtype=None,
+    ) -> None:
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
+        assert dim % (2 * num_heads) == 0, 'dim should be divisible by 2 * num_heads'
+
+        if norm_layer is None:
+            norm_layer = RmsNorm
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads // 2
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = use_fused_attn()
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
+        self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop_p = attn_drop
+        self.proj = nn.Linear(dim, dim, bias=proj_bias, **dd)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.lambda_q1 = nn.Parameter(torch.empty(self.head_dim, dtype=torch.float32, device=device))
+        self.lambda_k1 = nn.Parameter(torch.empty(self.head_dim, dtype=torch.float32, device=device))
+        self.lambda_q2 = nn.Parameter(torch.empty(self.head_dim, dtype=torch.float32, device=device))
+        self.lambda_k2 = nn.Parameter(torch.empty(self.head_dim, dtype=torch.float32, device=device))
+
+        self.sub_norm = RmsNorm(2 * self.head_dim, eps=1e-5, **dd)
+
+        self.lambda_init = 0.5
+
+        nn.init.normal_(self.lambda_q1, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_k1, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_q2, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_k2, mean=0, std=0.1)
+
+    def _compute_lambda(self) -> torch.Tensor:
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float())
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float())
+        return lambda_1 - lambda_2 + self.lambda_init
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+
+        q, k, v = self.qkv(x).chunk(3, dim=2)
+        q = q.reshape(B, N, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, N, 2 * self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, N, self.num_heads, 2 * self.head_dim).transpose(1, 2)
+
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        lambda_full = self._compute_lambda().type_as(q)
+
+        q = q.reshape(B, self.num_heads, 2, N, self.head_dim)
+        k = k.reshape(B, self.num_heads, 2, N, self.head_dim)
+        q1, q2 = q.unbind(2)
+        k1, k2 = k.unbind(2)
+
+        dropout_p = self.attn_drop_p if self.training else 0.0
+        attn1 = F.scaled_dot_product_attention(q1, k1, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        attn2 = F.scaled_dot_product_attention(q2, k2, v, attn_mask=attn_mask, dropout_p=dropout_p)
+
+        x = attn1 - lambda_full * attn2
+
+        x = self.sub_norm(x)
+        x = x * (1 - self.lambda_init)
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+class Block(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            init_values: Optional[float] = None,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: nn.Module = Mlp,
+    ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+        )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
-        
- 
+    
+
 class VisionTransformer(nn.Module):
     """ Vision Transformer
 
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
     """
+    dynamic_img_size: Final[bool]
 
     def __init__(
             self,
-            img_size=224,
-            patch_size=16,
-            in_chans=3,
-            num_classes=1000,
-            global_pool='token',
-            embed_dim=768,
-            depth=12,
-            num_heads=12,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            init_values=None,
-            class_token=True,
-            no_embed_class=False,
-            pre_norm=False,
-            fc_norm=None,
-            drop_rate=0.,
-            attn_drop_rate=0.,
-            drop_path_rate=0.,
-            weight_init='',
-            embed_layer=PatchEmbed,
-            norm_layer=None,
-            act_layer=None,
-            block_fn=Block,
-    ):
+            img_size: Union[int, Tuple[int, int]] = 224,
+            patch_size: Union[int, Tuple[int, int]] = 16,
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            global_pool: Literal['', 'avg', 'token', 'map'] = 'token',
+            embed_dim: int = 768,
+            depth: int = 12,
+            num_heads: int = 12,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            qk_norm: bool = False,
+            init_values: Optional[float] = None,
+            class_token: bool = True,
+            no_embed_class: bool = False,
+            reg_tokens: int = 0,
+            pre_norm: bool = False,
+            fc_norm: Optional[bool] = None,
+            dynamic_img_size: bool = False,
+            dynamic_img_pad: bool = False,
+            drop_rate: float = 0.,
+            pos_drop_rate: float = 0.,
+            patch_drop_rate: float = 0.,
+            proj_drop_rate: float = 0.,
+            attn_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
+            fix_init: bool = False,
+            embed_layer: Callable = PatchEmbed,
+            norm_layer: Optional[LayerType] = None,
+            act_layer: Optional[LayerType] = None,
+            block_fn: Type[nn.Module] = Block,
+            mlp_layer: Type[nn.Module] = Mlp,
+    ) -> None:
         """
         Args:
-            img_size (int, tuple): input image size
-            patch_size (int, tuple): patch size
-            in_chans (int): number of input channels
-            num_classes (int): number of classes for classification head
-            global_pool (str): type of global pooling for final sequence (default: 'token')
-            embed_dim (int): embedding dimension
-            depth (int): depth of transformer
-            num_heads (int): number of attention heads
-            mlp_ratio (int): ratio of mlp hidden dim to embedding dim
-            qkv_bias (bool): enable bias for qkv if True
-            init_values: (float): layer-scale init values
-            class_token (bool): use class token
-            fc_norm (Optional[bool]): pre-fc norm after pool, set if global_pool == 'avg' if None (default: None)
-            drop_rate (float): dropout rate
-            attn_drop_rate (float): attention dropout rate
-            drop_path_rate (float): stochastic depth rate
-            weight_init (str): weight init scheme
-            embed_layer (nn.Module): patch embedding layer
-            norm_layer: (nn.Module): normalization layer
-            act_layer: (nn.Module): MLP activation layer
+            img_size: Input image size.
+            patch_size: Patch size.
+            in_chans: Number of image input channels.
+            num_classes: Mumber of classes for classification head.
+            global_pool: Type of global pooling for final sequence (default: 'token').
+            embed_dim: Transformer embedding dimension.
+            depth: Depth of transformer.
+            num_heads: Number of attention heads.
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
+            qkv_bias: Enable bias for qkv projections if True.
+            init_values: Layer-scale init values (layer-scale enabled if not None).
+            class_token: Use class token.
+            no_embed_class: Don't include position embeddings for class (or reg) tokens.
+            reg_tokens: Number of register tokens.
+            fc_norm: Pre head norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
+            drop_rate: Head dropout rate.
+            pos_drop_rate: Position embedding dropout rate.
+            attn_drop_rate: Attention dropout rate.
+            drop_path_rate: Stochastic depth rate.
+            weight_init: Weight initialization scheme.
+            fix_init: Apply weight initialization fix (scaling w/ layer index).
+            embed_layer: Patch embedding layer.
+            norm_layer: Normalization layer.
+            act_layer: MLP activation layer.
+            block_fn: Transformer block layer.
         """
         super().__init__()
-        assert global_pool in ('', 'avg', 'token')
+        assert global_pool in ('', 'avg', 'token', 'map')
         assert class_token or global_pool != 'token'
         use_fc_norm = global_pool == 'avg' if fc_norm is None else fc_norm
-        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
-        act_layer = act_layer or nn.GELU
+        norm_layer = get_norm_layer(norm_layer) or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = get_act_layer(act_layer) or nn.GELU
 
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_prefix_tokens = 1 if class_token else 0
-        self.no_embed_class = no_embed_class
+        self.num_prefix_tokens += reg_tokens
+        self.num_reg_tokens = reg_tokens
+        self.has_class_token = class_token
+        self.no_embed_class = no_embed_class  # don't embed prefix positions (includes reg)
+        self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = False
 
+        embed_args = {}
+        if dynamic_img_size:
+            # flatten deferred until after pos embed
+            embed_args.update(dict(strict_img_size=False, output_fmt='NHWC'))
         self.patch_embed = embed_layer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
             bias=not pre_norm,  # disable bias if pre-norm is used (e.g. CLIP)
+            dynamic_img_pad=dynamic_img_pad,
+            **embed_args,
         )
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
+        self.reg_token = nn.Parameter(torch.zeros(1, reg_tokens, embed_dim)) if reg_tokens else None
         embed_len = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         self.pos_embed = nn.Parameter(torch.randn(1, embed_len, embed_dim) * .02)
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.pos_drop = nn.Dropout(p=pos_drop_rate)
+        if patch_drop_rate > 0:
+            self.patch_drop = PatchDropout(
+                patch_drop_rate,
+                num_prefix_tokens=self.num_prefix_tokens,
+            )
+        else:
+            self.patch_drop = nn.Identity()
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -325,24 +350,46 @@ class VisionTransformer(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
                 init_values=init_values,
-                drop=drop_rate,
+                proj_drop=proj_drop_rate,
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
-                act_layer=act_layer
+                act_layer=act_layer,
+                mlp_layer=mlp_layer,
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
+        if global_pool == 'map':
+            self.attn_pool = AttentionPoolLatent(
+                self.embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                norm_layer=norm_layer,
+            )
+        else:
+            self.attn_pool = None
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
+        self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
+        if fix_init:
+            self.fix_init_weight()
 
-    def init_weights(self, mode=''):
+    def fix_init_weight(self):
+        def rescale(param, _layer_id):
+            param.div_(math.sqrt(2.0 * _layer_id))
+
+        for layer_id, layer in enumerate(self.blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+
+    def init_weights(self, mode: str = '') -> None:
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
         trunc_normal_(self.pos_embed, std=.02)
@@ -350,58 +397,130 @@ class VisionTransformer(nn.Module):
             nn.init.normal_(self.cls_token, std=1e-6)
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
-    def _init_weights(self, m):
+    def _init_weights(self, m: nn.Module) -> None:
         # this fn left here for compat with downstream users
         init_weights_vit_timm(m)
 
     @torch.jit.ignore()
-    def load_pretrained(self, checkpoint_path, prefix=''):
+    def load_pretrained(self, checkpoint_path: str, prefix: str = '') -> None:
         _load_weights(self, checkpoint_path, prefix)
 
     @torch.jit.ignore
-    def no_weight_decay(self):
+    def no_weight_decay(self) -> Set:
         return {'pos_embed', 'cls_token', 'dist_token'}
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict:
         return dict(
             stem=r'^cls_token|pos_embed|patch_embed',  # stem and embed
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))]
         )
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool=None):
+    def reset_classifier(self, num_classes: int, global_pool = None) -> None:
         self.num_classes = num_classes
         if global_pool is not None:
-            assert global_pool in ('', 'avg', 'token')
+            assert global_pool in ('', 'avg', 'token', 'map')
+            if global_pool == 'map' and self.attn_pool is None:
+                assert False, "Cannot currently add attention pooling in reset_classifier()."
+            elif global_pool != 'map ' and self.attn_pool is not None:
+                self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def _pos_embed(self, x):
+    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
+        if self.dynamic_img_size:
+            B, H, W, C = x.shape
+            pos_embed = resample_abs_pos_embed(
+                self.pos_embed,
+                (H, W),
+                num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
+            )
+            x = x.view(B, -1, C)
+        else:
+            pos_embed = self.pos_embed
+
+        to_cat = []
+        if self.cls_token is not None:
+            to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
+        if self.reg_token is not None:
+            to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
+
         if self.no_embed_class:
             # deit-3, updated JAX (big vision)
             # position embedding does not overlap with class token, add then concat
-            x = x + self.pos_embed
-            if self.cls_token is not None:
-                x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+            x = x + pos_embed
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
         else:
             # original timm, JAX, and deit vit impl
             # pos_embed has entry for class token, concat then add
-            if self.cls_token is not None:
-                x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-            x = x + self.pos_embed
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
+            x = x + pos_embed
+
         return self.pos_drop(x)
 
-    def forward_features(self, x):
+    def _intermediate_layers(
+            self,
+            x: torch.Tensor,
+            n: Union[int, Sequence] = 1,
+    ) -> List[torch.Tensor]:
+        outputs, num_blocks = [], len(self.blocks)
+        take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
+
+        # forward pass
         x = self.patch_embed(x)
         x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i in take_indices:
+                outputs.append(x)
+
+        return outputs
+
+    def get_intermediate_layers(
+            self,
+            x: torch.Tensor,
+            n: Union[int, Sequence] = 1,
+            reshape: bool = False,
+            return_prefix_tokens: bool = False,
+            norm: bool = False,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+        """ Intermediate layer accessor (NOTE: This is a WIP experiment).
+        Inspired by DINO / DINOv2 interface
+        """
+        # take last n blocks if n is an int, if in is a sequence, select by matching indices
+        outputs = self._intermediate_layers(x, n)
+        if norm:
+            outputs = [self.norm(out) for out in outputs]
+        prefix_tokens = [out[:, 0:self.num_prefix_tokens] for out in outputs]
+        outputs = [out[:, self.num_prefix_tokens:] for out in outputs]
+
+        if reshape:
+            grid_size = self.patch_embed.grid_size
+            outputs = [
+                out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1, 2).contiguous()
+                for out in outputs
+            ]
+
+        if return_prefix_tokens:
+            return tuple(zip(outputs, prefix_tokens))
+        return tuple(outputs)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
         x = self.norm_pre(x)
         if self.grad_checkpointing and not torch.jit.is_scripting():
             x = checkpoint_seq(self.blocks, x)
@@ -410,77 +529,29 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
-        if self.global_pool:
-            x = x[:, self.num_prefix_tokens:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        if self.attn_pool is not None:
+            x = self.attn_pool(x)
+        elif self.global_pool == 'avg':
+            x = x[:, self.num_prefix_tokens:].mean(dim=1)
+        elif self.global_pool:
+            x = x[:, 0]  # class token
         x = self.fc_norm(x)
+        x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
 
 @register_model
-def deit_tiny_patch16_224(pretrained=False, **kwargs):
-    kwargs = _sanitize_model_kwargs(kwargs)
+def diff_deit_tiny_patch16_224(pretrained=False, **kwargs):
+    kwargs = _cleanup_timm_factory_kwargs(kwargs)
     model = VisionTransformer(
         patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth",
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
 
-
-@register_model
-def deit_small_patch16_224(pretrained=False, **kwargs):
-    kwargs = _sanitize_model_kwargs(kwargs)
-    model = VisionTransformer(
-        patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth",
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
-
-
-@register_model
-def deit_base_patch16_224(pretrained=False, **kwargs):
-    kwargs = _sanitize_model_kwargs(kwargs)
-    model = VisionTransformer(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
-
-
-@register_model
-def deit_base_patch16_384(pretrained=False, **kwargs):
-    kwargs = _sanitize_model_kwargs(kwargs)
-    model = VisionTransformer(
-        img_size=384, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_384-8de9b5d1.pth",
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
     return model
