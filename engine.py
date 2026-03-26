@@ -5,6 +5,8 @@ Train and eval functions used in main.py
 """
 import math
 import sys
+import inspect
+from contextlib import nullcontext
 from typing import Iterable, Optional
 
 import torch
@@ -16,101 +18,124 @@ from losses import DistillationLoss
 import utils
 
 
+def _get_autocast_context(device: torch.device, amp: bool, amp_dtype: str):
+    if not amp or device.type != 'cuda':
+        return nullcontext()
+    dtype = torch.float16 if amp_dtype == 'float16' else torch.bfloat16
+    return torch.autocast(device_type='cuda', dtype=dtype)
+
+
+def _loss_scaler_supports_update_grad(loss_scaler) -> bool:
+    try:
+        return 'update_grad' in inspect.signature(loss_scaler.__call__).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _backward_only(loss_scaler, loss: torch.Tensor, create_graph: bool = False) -> None:
+    scaler = getattr(loss_scaler, '_scaler', None)
+    if scaler is not None:
+        scaler.scale(loss).backward(create_graph=create_graph)
+        return
+    loss.backward(create_graph=create_graph)
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True, args=None):
+                    set_training_mode=True, args=None, amp: bool = True,
+                    amp_dtype: str = 'float16', channels_last: bool = False,
+                    grad_set_to_none: bool = True, sync_step: bool = False,
+                    accumulation_steps: int = 1):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 100
-
+    
     if args.cosub:
         criterion = torch.nn.BCEWithLogitsLoss()
-
-    accum_iter = max(1, getattr(args, 'accum_iter', 1))
-    optimizer.zero_grad(set_to_none=True)
+    accumulation_steps = max(1, accumulation_steps)
+    num_steps = len(data_loader)
+    scaler_supports_update_grad = _loss_scaler_supports_update_grad(loss_scaler)
+    optimizer.zero_grad(set_to_none=grad_set_to_none)
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        if data_iter_step % accum_iter == 0:
-            optimizer.zero_grad(set_to_none=True)
-
+        global_step = data_iter_step + 1
+        should_update = (global_step % accumulation_steps == 0) or (global_step == num_steps)
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        if channels_last and samples.ndim == 4:
+            samples = samples.contiguous(memory_format=torch.channels_last)
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
-
+            
         if args.cosub:
-            samples = torch.cat((samples, samples), dim=0)
-
+            samples = torch.cat((samples,samples),dim=0)
+            
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
 
-        with torch.cuda.amp.autocast():
-            outputs = model(samples)
-            if not args.cosub:
-                loss = criterion(samples, outputs, targets)
-            else:
-                outputs = torch.split(outputs, outputs.shape[0] // 2, dim=0)
-                loss  = 0.25 * criterion(outputs[0], targets)
-                loss += 0.25 * criterion(outputs[1], targets)
-                loss += 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
-                loss += 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid())
+        sync_context = model.no_sync() if hasattr(model, 'no_sync') and not should_update else nullcontext()
+        with sync_context:
+            with _get_autocast_context(device, amp=amp, amp_dtype=amp_dtype):
+                outputs = model(samples)
+                if not args.cosub:
+                    loss = criterion(samples, outputs, targets)
+                else:
+                    outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
+                    loss = 0.25 * criterion(outputs[0], targets)
+                    loss = loss + 0.25 * criterion(outputs[1], targets)
+                    loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
+                    loss = loss + 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid())
 
         loss_value = loss.item()
+
         if not math.isfinite(loss_value):
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Loss is {loss_value} at step {data_iter_step} (lr={current_lr:.6g}), stopping training")
-            print("Hint: try lowering LR and/or setting --clip-grad 1.0")
+            print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
-        # Normalize for accumulation
-        loss = loss / accum_iter
-
+        # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        do_update = ((data_iter_step + 1) % accum_iter == 0)
-
-        # ---- AMP-compatible accumulation without `update_grad` ----
-        scaler = getattr(loss_scaler, "_scaler", None)
-        if scaler is not None:
-            # timm's NativeScaler holds a torch GradScaler at ._scaler
-            scaler.scale(loss).backward(create_graph=is_second_order)
-            if do_update:
-                if max_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                scaler.step(optimizer)
-                scaler.update()
+        loss = loss / accumulation_steps
+        if scaler_supports_update_grad:
+            loss_scaler(
+                loss, optimizer,
+                clip_grad=max_norm if should_update else None,
+                parameters=model.parameters(),
+                create_graph=is_second_order,
+                update_grad=should_update,
+            )
+        elif should_update:
+            loss_scaler(
+                loss, optimizer,
+                clip_grad=max_norm,
+                parameters=model.parameters(),
+                create_graph=is_second_order,
+            )
         else:
-            # Fallback: either NativeScaler without ._scaler or a plain object; do best-effort
-            # Accumulate grads
-            loss.backward(create_graph=is_second_order)
-            if do_update:
-                if max_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                optimizer.step()
-        # ----------------------------------------------------------
-
-        if do_update:
-            torch.cuda.synchronize()
+            # Older timm NativeScaler has no update_grad; run backward-only for micro-steps.
+            _backward_only(loss_scaler, loss, create_graph=is_second_order)
+        if should_update:
+            optimizer.zero_grad(set_to_none=grad_set_to_none)
+            if sync_step and device.type == 'cuda':
+                torch.cuda.synchronize(device=device)
             if model_ema is not None:
                 model_ema.update(model)
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-
+    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-
-@torch.no_grad()
-def evaluate(data_loader, model, device):
+@torch.inference_mode()
+def evaluate(data_loader, model, device, amp: bool = True, amp_dtype: str = 'float16',
+             channels_last: bool = False):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -122,9 +147,11 @@ def evaluate(data_loader, model, device):
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        if channels_last and images.ndim == 4:
+            images = images.contiguous(memory_format=torch.channels_last)
 
         # compute output
-        with torch.cuda.amp.autocast():
+        with _get_autocast_context(device, amp=amp, amp_dtype=amp_dtype):
             output = model(images)
             loss = criterion(output, target)
 
